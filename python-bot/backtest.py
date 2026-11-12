@@ -1,0 +1,650 @@
+"""
+backtest.py (fast version)
+--------------------------
+Runs the signal engine over historical data with proper trade management.
+
+Speed trick: pre-computes indicator rows, then indexes directly into
+NumPy arrays during the loop. No DataFrame slicing per bar.
+
+Usage:
+    python backtest.py --mode intraday
+    python backtest.py --mode scalp
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+import pandas_ta_classic as ta
+from dataclasses import dataclass
+from typing import Optional
+from datetime import datetime
+
+import config as cfg
+from signal_engine import load_tf, add_indicators
+
+
+# ============================================================
+# TRADE RECORD
+# ============================================================
+@dataclass
+class Trade:
+    mode: str
+    direction: str
+    signal_time: datetime          # bar where the confluence conditions fired
+    entry_time: datetime           # bar actually filled on
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    stop_pips: float
+    lot_size: float
+    confidence: int
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float]   = None
+    exit_reason: Optional[str]    = None
+    pips_result: float = 0.0
+    usd_result: float = 0.0
+    r_multiple: float = 0.0
+    rr: float = 2.0
+
+
+PIP_VALUE_PER_LOT = 10.0
+
+
+def usd_pnl(pips, lot_size):
+    return pips * lot_size * PIP_VALUE_PER_LOT
+
+
+# ============================================================
+# PREP: attach latest higher-TF state to every trigger bar
+# ============================================================
+def build_aligned_frames(dfs, mode_cfg):
+    """
+    For each M15 bar timestamp, find the last CLOSED bar on each HTF.
+    Returns a dict of numpy arrays aligned to the trigger index.
+    """
+    trigger_tf = mode_cfg["trigger_tf"]
+    df_trig = dfs[trigger_tf]
+    trigger_index = df_trig.index
+
+    aligned = {"trigger": df_trig}
+
+    for tf_key in ("bias_tf", "confirm_tf", "setup_tf"):
+        tf = mode_cfg[tf_key]
+        df_ht = dfs[tf]
+
+        # FIX (look-ahead bias): a higher-timeframe bar's timestamp marks
+        # when it OPENED, not when it closed. reindex(..., method="ffill")
+        # against the raw frame was picking up "the bar whose index <= this
+        # M15 timestamp" — which, for a same-day D1 bar or same-4h H4 bar,
+        # is a bar that hasn't finished forming yet, so its close/EMA
+        # values are technically from later that day/period. Shifting by
+        # one row first means every M15 timestamp only ever sees a higher
+        # timeframe bar that had genuinely already closed.
+        df_ht_closed = df_ht.shift(1)
+
+        df_re = df_ht_closed.reindex(trigger_index, method="ffill")
+        aligned[tf_key] = df_re
+
+    return aligned
+
+
+def session_ok(ts):
+    h = ts.hour
+    return (cfg.LONDON_OPEN <= h < cfg.LONDON_CLOSE) or (cfg.NY_OPEN <= h < cfg.NY_CLOSE)
+
+
+# ============================================================
+# RISK (reuse from signal_engine concept, inline for speed)
+# ============================================================
+def compute_risk(entry, direction, atr_setup, mode_cfg, spread_pips):
+    stop_dist = mode_cfg["atr_stop_mult"] * atr_setup
+    if direction == "BUY":
+        sl  = entry - stop_dist
+        tp1 = entry + mode_cfg["rr_tp1"] * stop_dist
+    else:
+        sl  = entry + stop_dist
+        tp1 = entry - mode_cfg["rr_tp1"] * stop_dist
+
+    stop_pips = stop_dist / cfg.PIP_SIZE
+    risk_usd  = cfg.ACCOUNT_BALANCE * cfg.RISK_PER_TRADE
+    raw_lot   = risk_usd / (stop_pips * PIP_VALUE_PER_LOT) if stop_pips > 0 else 0
+    clamped   = max(cfg.MIN_LOT, min(cfg.MAX_LOT, round(raw_lot, 2)))
+
+    return {
+        "stop_pips":     round(stop_pips, 1),
+        "stop_loss":     round(sl, 5),
+        "take_profit_1": round(tp1, 5),
+        "lot_size":      clamped,
+    }
+
+
+def bias_to_signal(bias):
+    return "BUY" if bias == "BULLISH" else "SELL"
+
+
+# ============================================================
+# BACKTEST LOOP
+# ============================================================
+def run_backtest(dfs, mode_name, mode_cfg, bt_cfg, verbose=False, start=None, end=None):
+    aligned = build_aligned_frames(dfs, mode_cfg)
+
+    df_trig = aligned["trigger"]
+    n = len(df_trig)
+    ts_index_for_range = df_trig.index
+
+    # Convert to numpy arrays for speed.
+    o = df_trig["open"].to_numpy()
+    h = df_trig["high"].to_numpy()
+    l = df_trig["low"].to_numpy()
+    c = df_trig["close"].to_numpy()
+    rsi_t = df_trig["rsi"].to_numpy()
+    ema_fast_t = df_trig["ema_fast"].to_numpy()
+    spread_t = df_trig["spread"].to_numpy()
+    ts_index = df_trig.index
+
+    # HTF aligned arrays.
+    bias_ema_mid  = aligned["bias_tf"]["ema_mid"].to_numpy()
+    bias_ema_slow = aligned["bias_tf"]["ema_slow"].to_numpy()
+    bias_adx      = aligned["bias_tf"]["adx"].to_numpy()
+    bias_close    = aligned["bias_tf"]["close"].to_numpy()
+
+    conf_ema_mid  = aligned["confirm_tf"]["ema_mid"].to_numpy()
+    conf_close    = aligned["confirm_tf"]["close"].to_numpy()
+
+    setup_ema_fast = aligned["setup_tf"]["ema_fast"].to_numpy()
+    setup_ema_mid  = aligned["setup_tf"]["ema_mid"].to_numpy()
+    setup_ema_slow = aligned["setup_tf"]["ema_slow"].to_numpy()
+    setup_atr      = aligned["setup_tf"]["atr"].to_numpy()
+    setup_rsi      = aligned["setup_tf"]["rsi"].to_numpy()
+    setup_close    = aligned["setup_tf"]["close"].to_numpy()
+
+    trades = []
+    open_trade: Optional[Trade] = None
+    open_trade_bar = -1
+    cooldown_until = 0
+
+    warmup = max(
+        cfg.EMA_SLOW,
+        cfg.ATR_PERIOD,
+        cfg.ADX_PERIOD,
+    ) + 20
+
+    # --------------------------------------------------------
+    # Requested backtest range
+    # --------------------------------------------------------
+    # Indicators are still calculated from the complete dataset
+    # so EMA200/ATR/etc. have sufficient warmup history.
+    #
+    # However:
+    #   - signals may only OPEN inside the requested range;
+    #   - a signal on the final allowed bar cannot open outside it;
+    #   - an open trade is forcibly closed at the final bar of the
+    #     requested range.
+    range_start_i = warmup
+    range_end_i = n
+
+    if start is not None:
+        start_ts = pd.Timestamp(start, tz="UTC")
+        range_start_i = max(
+            range_start_i,
+            ts_index_for_range.searchsorted(
+                start_ts,
+                side="left",
+            ),
+        )
+
+    if end is not None:
+        end_ts = pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
+        range_end_i = min(
+            range_end_i,
+            ts_index_for_range.searchsorted(
+                end_ts,
+                side="left",
+            ),
+        )
+
+    # Last bar that belongs to the requested range.
+    # If the requested range ends before the dataset, this is
+    # range_end_i - 1. Otherwise it is the final dataset bar.
+    range_last_i = range_end_i - 1
+
+    if range_last_i < warmup:
+        return trades
+
+    # --------------------------------------------------------
+    # BACKTEST LOOP
+    # --------------------------------------------------------
+    for i in range(warmup, range_end_i):
+
+        # ----------------------------------------------------
+        # Manage open trade
+        # ----------------------------------------------------
+        if open_trade is not None:
+
+            # Never allow a training/test trade to be managed
+            # beyond the requested range.
+            if i > range_last_i:
+                break
+
+            # SL / TP checks
+            if open_trade.direction == "BUY":
+                hit_sl = l[i] <= open_trade.stop_loss
+                hit_tp = h[i] >= open_trade.take_profit
+            else:
+                hit_sl = h[i] >= open_trade.stop_loss
+                hit_tp = l[i] <= open_trade.take_profit
+
+            if hit_sl:
+                open_trade.exit_time = ts_index[i]
+                open_trade.exit_price = open_trade.stop_loss
+                open_trade.exit_reason = "SL"
+
+                open_trade.pips_result = (
+                    -open_trade.stop_pips
+                    - cfg.SPREAD_PIPS
+                )
+
+                open_trade.usd_result = usd_pnl(
+                    open_trade.pips_result,
+                    open_trade.lot_size,
+                )
+
+                open_trade.r_multiple = (
+                    open_trade.pips_result
+                    / open_trade.stop_pips
+                )
+
+                trades.append(open_trade)
+                open_trade = None
+                cooldown_until = i + bt_cfg["cooldown_bars"]
+                continue
+
+            if hit_tp:
+                open_trade.exit_time = ts_index[i]
+                open_trade.exit_price = open_trade.take_profit
+                open_trade.exit_reason = "TP"
+
+                open_trade.pips_result = (
+                    open_trade.stop_pips
+                    * open_trade.rr
+                    - cfg.SPREAD_PIPS
+                )
+
+                open_trade.usd_result = usd_pnl(
+                    open_trade.pips_result,
+                    open_trade.lot_size,
+                )
+
+                open_trade.r_multiple = (
+                    open_trade.pips_result
+                    / open_trade.stop_pips
+                )
+
+                trades.append(open_trade)
+                open_trade = None
+                cooldown_until = i + bt_cfg["cooldown_bars"]
+                continue
+
+            # Time exit
+            if bt_cfg["time_exit_bars"] is not None:
+                if (i - open_trade_bar) >= bt_cfg["time_exit_bars"]:
+
+                    pips = (
+                        (c[i] - open_trade.entry_price)
+                        / cfg.PIP_SIZE
+                    )
+
+                    if open_trade.direction == "SELL":
+                        pips = -pips
+
+                    pips -= cfg.SPREAD_PIPS
+
+                    open_trade.exit_time = ts_index[i]
+                    open_trade.exit_price = c[i]
+                    open_trade.exit_reason = "TIME"
+                    open_trade.pips_result = pips
+                    open_trade.usd_result = usd_pnl(
+                        pips,
+                        open_trade.lot_size,
+                    )
+                    open_trade.r_multiple = (
+                        pips / open_trade.stop_pips
+                    )
+
+                    trades.append(open_trade)
+                    open_trade = None
+                    cooldown_until = i + bt_cfg["cooldown_bars"]
+                    continue
+
+            # Trade still open.
+            continue
+
+        # ----------------------------------------------------
+        # No open trade
+        # ----------------------------------------------------
+        if i < cooldown_until:
+            continue
+
+        if i < range_start_i or i >= range_end_i:
+            continue
+
+        # ----------------------------------------------------
+        # Regime
+        # ----------------------------------------------------
+        bias = "RANGING"
+
+        if not (
+            pd.isna(bias_ema_slow[i])
+            or pd.isna(conf_ema_mid[i])
+        ):
+            bull = 0
+            bear = 0
+
+            if bias_ema_mid[i] > bias_ema_slow[i]:
+                bull += 1
+            elif bias_ema_mid[i] < bias_ema_slow[i]:
+                bear += 1
+
+            if conf_close[i] > conf_ema_mid[i]:
+                bull += 1
+            elif conf_close[i] < conf_ema_mid[i]:
+                bear += 1
+
+            if bull > bear:
+                bias = "BULLISH"
+            elif bear > bull:
+                bias = "BEARISH"
+
+        if bias == "RANGING":
+            continue
+
+        # ----------------------------------------------------
+        # Setup
+        # ----------------------------------------------------
+        if (
+            pd.isna(setup_ema_mid[i])
+            or pd.isna(setup_rsi[i])
+            or pd.isna(setup_atr[i])
+        ):
+            continue
+
+        near_fast = (
+            abs(setup_close[i] - setup_ema_fast[i])
+            < 1.0 * setup_atr[i]
+        )
+
+        near_mid = (
+            abs(setup_close[i] - setup_ema_mid[i])
+            < 1.0 * setup_atr[i]
+        )
+
+        in_pull = near_fast or near_mid
+        rsi_ok = 35 <= setup_rsi[i] <= 65
+
+        setup_ok = False
+
+        if (
+            bias == "BULLISH"
+            and in_pull
+            and setup_close[i] > setup_ema_slow[i]
+            and rsi_ok
+        ):
+            setup_ok = True
+
+        if (
+            bias == "BEARISH"
+            and in_pull
+            and setup_close[i] < setup_ema_slow[i]
+            and rsi_ok
+        ):
+            setup_ok = True
+
+        if not setup_ok:
+            continue
+
+        # ----------------------------------------------------
+        # Trigger
+        # ----------------------------------------------------
+        if (
+            i < 1
+            or pd.isna(rsi_t[i])
+            or pd.isna(rsi_t[i - 1])
+        ):
+            continue
+
+        trigger_ok = False
+
+        if bias == "BULLISH":
+            if rsi_t[i - 1] < 50 <= rsi_t[i]:
+                trigger_ok = True
+            elif c[i] > ema_fast_t[i] and c[i] > o[i]:
+                trigger_ok = True
+
+        else:
+            if rsi_t[i - 1] > 50 >= rsi_t[i]:
+                trigger_ok = True
+            elif c[i] < ema_fast_t[i] and c[i] < o[i]:
+                trigger_ok = True
+
+        if not trigger_ok:
+            continue
+
+        # ----------------------------------------------------
+        # Session
+        # ----------------------------------------------------
+        ts = ts_index[i]
+        in_session = session_ok(ts)
+
+        if bt_cfg["require_session"] and not in_session:
+            continue
+
+        # ----------------------------------------------------
+        # Confidence
+        # ----------------------------------------------------
+        confidence = 1  # regime
+        confidence += 1  # setup
+        confidence += 1  # trigger
+
+        if in_session:
+            confidence += 1
+
+        spread_pips = spread_t[i] / 10.0
+
+        if spread_pips <= cfg.MAX_SPREAD_PIPS:
+            confidence += 1
+
+        if confidence < mode_cfg["min_confidence"]:
+            continue
+
+        # ----------------------------------------------------
+        # Next-bar execution
+        # ----------------------------------------------------
+        fill_i = i + 1
+
+        # Critical split-boundary protection:
+        # the signal must be able to fill INSIDE the requested
+        # range. A final training signal cannot create a trade
+        # whose entry occurs in the test period.
+        if fill_i >= n or fill_i >= range_end_i:
+            continue
+
+        entry = o[fill_i]
+        atr_setup = setup_atr[i]
+
+        risk = compute_risk(
+            entry,
+            bias_to_signal(bias),
+            atr_setup,
+            mode_cfg,
+            spread_pips,
+        )
+
+        trade = Trade(
+            mode=mode_name,
+            direction=bias_to_signal(bias),
+            signal_time=ts,
+            entry_time=ts_index[fill_i],
+            entry_price=entry,
+            stop_loss=risk["stop_loss"],
+            take_profit=risk["take_profit_1"],
+            stop_pips=risk["stop_pips"],
+            lot_size=risk["lot_size"],
+            confidence=confidence,
+            rr=mode_cfg["rr_tp1"],
+        )
+
+        open_trade = trade
+        open_trade_bar = fill_i
+
+        if verbose:
+            print(
+                f"[{fill_i}] "
+                f"{trade.entry_time} "
+                f"{trade.direction} @ "
+                f"{trade.entry_price}"
+            )
+
+    # --------------------------------------------------------
+    # Range-end close
+    # --------------------------------------------------------
+    # If a trade remains open when the requested range ends,
+    # close it at the LAST BAR OF THAT RANGE — never at the end
+    # of the full dataset.
+    if open_trade is not None:
+
+        exit_i = range_last_i
+
+        if exit_i >= open_trade_bar:
+
+            pips = (
+                (c[exit_i] - open_trade.entry_price)
+                / cfg.PIP_SIZE
+            )
+
+            if open_trade.direction == "SELL":
+                pips = -pips
+
+            pips -= cfg.SPREAD_PIPS
+
+            open_trade.exit_time = ts_index[exit_i]
+            open_trade.exit_price = c[exit_i]
+            open_trade.exit_reason = "END"
+            open_trade.pips_result = pips
+            open_trade.usd_result = usd_pnl(
+                pips,
+                open_trade.lot_size,
+            )
+            open_trade.r_multiple = (
+                pips / open_trade.stop_pips
+            )
+
+            trades.append(open_trade)
+
+    return trades
+
+
+# ============================================================
+# REPORTING
+# ============================================================
+def summarize(trades, mode_name):
+    print(f"\n{'='*60}")
+    print(f"BACKTEST REPORT — {mode_name.upper()}")
+    print(f"{'='*60}")
+
+    if not trades:
+        print("No trades were opened.")
+        return
+
+    df = pd.DataFrame([t.__dict__ for t in trades])
+    total = len(df)
+    wins = df[df["r_multiple"] > 0]
+    losses = df[df["r_multiple"] < 0]
+    win_rate = len(wins) / total * 100
+    avg_r = df["r_multiple"].mean()
+    total_r = df["r_multiple"].sum()
+    total_usd = df["usd_result"].sum()
+
+    df_sorted = df.sort_values("exit_time")
+    equity = df_sorted["usd_result"].cumsum()
+    peak = equity.cummax()
+    max_dd_usd = (equity - peak).min()
+
+    print(f"Total trades:      {total}")
+    print(f"Wins / Losses:     {len(wins)} / {len(losses)}")
+    print(f"Win rate:          {win_rate:.2f}%")
+    print(f"Avg R / trade:     {avg_r:.3f}")
+    print(f"Total R:           {total_r:.2f}")
+    print(f"Total USD P&L:     ${total_usd:.2f}")
+    print(f"Max drawdown:      ${max_dd_usd:.2f}")
+    print(f"Start balance:     ${cfg.ACCOUNT_BALANCE:.2f}")
+    print(f"End balance:       ${cfg.ACCOUNT_BALANCE + total_usd:.2f}")
+    print(f"(spread cost of {cfg.SPREAD_PIPS} pips/trade already included above)")
+
+    print(f"\nExit reasons:")
+    for reason, count in df["exit_reason"].value_counts().items():
+        print(f"  {reason}: {count}")
+
+    print(f"\nDirection breakdown:")
+    for direction in ("BUY", "SELL"):
+        sub = df[df["direction"] == direction]
+        if len(sub):
+            wr = (sub["r_multiple"] > 0).mean() * 100
+            print(f"  {direction}: {len(sub)} trades | win rate {wr:.1f}% | "
+                  f"total R {sub['r_multiple'].sum():.2f}")
+
+    out = f"backtest_{mode_name}_trades.csv"
+    df.to_csv(out, index=False)
+    print(f"\nTrades saved to: {out}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["intraday", "scalp"], default="intraday")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--split", choices=["train", "test", "all"], default="train",
+                         help="train = tune here; test = run ONCE at the end as a holdout; "
+                              "all = full history (old behavior, no split)")
+    parser.add_argument("--start", help="override start date YYYY-MM-DD (takes precedence over --split)")
+    parser.add_argument("--end", help="override end date YYYY-MM-DD (takes precedence over --split)")
+    args = parser.parse_args()
+
+    mode_cfg = cfg.MODES[args.mode]
+    bt_cfg   = cfg.BACKTEST[args.mode]
+
+    needed = {mode_cfg["bias_tf"], mode_cfg["confirm_tf"],
+              mode_cfg["setup_tf"], mode_cfg["trigger_tf"]}
+    dfs = {}
+    for tf in needed:
+        print(f"Loading {tf}…")
+        dfs[tf] = add_indicators(load_tf(tf))
+
+    if args.start or args.end:
+        start, end = args.start, args.end
+        label = f"{start or 'earliest'} -> {end or 'latest'}"
+    elif args.split == "train":
+        start, end = cfg.SPLIT["train_start"], cfg.SPLIT["train_end"]
+        label = f"TRAIN {start} -> {end}"
+    elif args.split == "test":
+        start, end = cfg.SPLIT["test_start"], cfg.SPLIT["test_end"]
+        label = f"TEST (HOLDOUT) {start} -> {end or 'latest'}"
+    else:
+        start, end = None, None
+        label = "ALL DATA (no split)"
+
+    print(f"\nRunning backtest: mode={args.mode} | split={label}")
+    if args.split == "test" and not (args.start or args.end):
+        print("!! This is your holdout set — only meant to be run once you're")
+        print("!! done tuning on --split train. If you're about to go tweak a")
+        print("!! filter after seeing this result, that defeats the point.\n")
+
+    print(f"Trigger bars to scan: {len(dfs[mode_cfg['trigger_tf']]):,}")
+
+    trades = run_backtest(dfs, args.mode, mode_cfg, bt_cfg, verbose=args.verbose, start=start, end=end)
+    summarize(trades, args.mode)
+
+
+if __name__ == "__main__":
+    main()
